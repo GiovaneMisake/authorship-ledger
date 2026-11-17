@@ -28,7 +28,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
 
 const LEDGER_VERSION = 1;
 const DIR_NAME = '.authorship';
@@ -126,6 +126,9 @@ function loadConfig(p) {
     recordAuthorEmail: true,
     recordMachineInfo: true,
     humanReadableLog: true,
+    trackAiActivity: true,
+    autoAnchor: true,
+    autoAnchorHours: 24,
   };
   try {
     return { ...defaults, ...JSON.parse(fs.readFileSync(p.config, 'utf8')) };
@@ -150,7 +153,7 @@ const SECRET_PATTERNS = [
   [/(\b[a-z][a-z0-9+.-]{1,20}:\/\/[^\s:@/]{1,200}:)[^\s@/]{1,200}@/gi, '$1[REDACTED]@'],
   // key = value / "key": "value". Group 3 is the value; `skip` keeps code such as
   // `pwd = os.getcwd()` or `token = tokenizer.encode(x)` from being mangled.
-  [/((?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret)["']?\s*[:=]\s*)(["']?)([^\s"'()[\]{},;]{6,})\2/gi,
+  [/((?:password|passwd|pass|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret)["']?\s*[:=]\s*)(["']?)([^\s"'()[\]{},;]{6,})\2/gi,
     '$1$2[REDACTED]$2',
     (args) => {
       const value = args[3];
@@ -278,14 +281,17 @@ function withLock(p, fn) {
       fs.writeSync(fd, String(process.pid));
       break;
     } catch (e) {
-      if (e.code !== 'EEXIST') throw e;
+      // On Windows a lock file that another process is deleting reports EPERM /
+      // EACCES / EBUSY instead of EEXIST: that's "busy, retry", not a failure.
+      if (!['EEXIST', 'EPERM', 'EACCES', 'EBUSY'].includes(e.code)) throw e;
       try {
         const st = fs.statSync(p.lock);
         const age = Date.now() - st.mtimeMs;
         const owner = parseInt(fs.readFileSync(p.lock, 'utf8'), 10);
-        // Stale when the owner died, or when it has held the lock implausibly long.
-        // (A lock just created may not have its PID written yet: give it 200 ms.)
-        if (age > LOCK_STALE_MS || (age > 200 && !pidAlive(owner))) breakStaleLock(p, st);
+        // Stale when its owner process is gone, or when it is held implausibly
+        // long. A lock with no PID yet was only just created: age alone decides.
+        const deadOwner = Number.isInteger(owner) && owner > 0 && age > 200 && !pidAlive(owner);
+        if (age > LOCK_STALE_MS || deadOwner) breakStaleLock(p, st);
       } catch (_) { /* raced with another process: retry */ }
       if (Date.now() > deadline) throw new Error('ledger lock timeout');
       sleepMs(20);
@@ -322,6 +328,64 @@ function readItems(p) {
 }
 
 const entriesOf = (items) => items.filter((x) => x.entry).map((x) => x.entry);
+
+const TAIL_CHUNK = 256 * 1024;
+
+/**
+ * What an append needs — the last valid entry, the unusable lines after it and
+ * whether the file lacks a final newline — read from the end of the file, so
+ * hooks stay fast however long the ledger grows. Falls back to a full read
+ * when the last valid entry isn't inside the final chunk.
+ */
+function readTail(p) {
+  let fd;
+  try {
+    fd = fs.openSync(p.ledger, 'r');
+  } catch (e) {
+    if (e.code === 'ENOENT') return { prev: null, badTail: [], needsNewline: false };
+    throw e;
+  }
+  try {
+    const size = fs.fstatSync(fd).size;
+    if (!size) return { prev: null, badTail: [], needsNewline: false };
+    const len = Math.min(size, TAIL_CHUNK);
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, size - len);
+    const needsNewline = buf[len - 1] !== 0x0a;
+    let lines = buf.toString('utf8').split('\n');
+    if (len < size) lines = lines.slice(1); // the first line may start mid-entry
+    const bad = [];
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].replace(/\r$/, '');
+      if (!line.trim()) continue;
+      let o;
+      try { o = JSON.parse(line); } catch (_) { o = undefined; }
+      if (isEntry(o)) return { prev: o, badTail: bad.reverse(), needsNewline };
+      bad.push({ raw: line });
+    }
+    if (len === size) return { prev: null, badTail: bad.reverse(), needsNewline };
+  } finally {
+    fs.closeSync(fd);
+  }
+  const { items, text } = readItems(p);
+  let lastIdx = -1;
+  for (let i = items.length - 1; i >= 0; i--) if (items[i].entry) { lastIdx = i; break; }
+  return {
+    prev: lastIdx >= 0 ? items[lastIdx].entry : null,
+    badTail: items.slice(lastIdx + 1),
+    needsNewline: !!text && !text.endsWith('\n'),
+  };
+}
+
+function latestAnchor(p) {
+  let files = [];
+  try { files = fs.readdirSync(p.anchors).filter((f) => f.endsWith('.txt')).sort(); } catch (_) { return null; }
+  if (!files.length) return null;
+  const f = files[files.length - 1];
+  const full = path.join(p.anchors, f);
+  const m = fs.readFileSync(full, 'utf8').match(/^head_seq:\s*(\d+)/m);
+  return { file: f, seq: m ? parseInt(m[1], 10) : 0, mtimeMs: fs.statSync(full).mtimeMs };
+}
 
 function readAnchors(p) {
   let files = [];
@@ -408,7 +472,11 @@ const LEDGER_README = `# .authorship — human authorship ledger
 
 Written by the **authorship-ledger** Claude Code plugin. Every prompt the
 human author typed into Claude Code is appended to \`ledger.jsonl\` as a
-hash-chained entry (each entry contains the SHA-256 of the previous one).
+hash-chained entry (each entry contains the SHA-256 of the previous one),
+together with a record of what Claude itself did: the files it wrote or
+edited (hashes only, no content) and the shell commands it ran. Comparing
+those with the project's files shows which files are still exactly what Claude
+left and which were changed afterwards (git history shows by whom).
 
 What this proves: editing, deleting or reordering an entry breaks the chain
 and is reported by \`/authorship-ledger:verify\`. Removing the newest entries,
@@ -420,7 +488,8 @@ push regularly.
 - \`PROMPTS.md\`   — human-readable copy.
 - \`anchors/\`     — chain-head snapshots, optionally with OpenTimestamps \`.ots\` proofs.
 - \`config.json\`  — optional settings: enabled, redactSecrets, recordAuthorEmail,
-                    recordMachineInfo, humanReadableLog.
+                    recordMachineInfo, humanReadableLog, trackAiActivity,
+                    autoAnchor, autoAnchorHours.
 
 If you commit this folder, commit it from ONE branch only: switching branches
 would swap ledger.jsonl and fork the chain. See the plugin README.
@@ -432,6 +501,8 @@ function ensureDir(p) {
   // Keep bytes exact (OpenTimestamps proofs, hashes) and never let git write
   // conflict markers into the ledger.
   if (!fs.existsSync(p.gitattributes)) fs.writeFileSync(p.gitattributes, '* -text -merge\n');
+  const gi = path.join(p.dir, '.gitignore');
+  if (!fs.existsSync(gi)) fs.writeFileSync(gi, '# transient files written by the hooks\n.lock\n.lock.stale-*\n.pending/\n');
 }
 
 function author(cwd, cfg) {
@@ -444,14 +515,84 @@ function author(cwd, cfg) {
   return a;
 }
 
+/** Project-relative POSIX path; never leaks an absolute path. */
+function relPath(root, target) {
+  const rel = path.relative(root, target);
+  if (path.isAbsolute(rel) || rel === '..' || rel.startsWith('..' + path.sep)) return '<outside project>';
+  return rel.split(path.sep).join('/') || '.';
+}
+
+/**
+ * SHA-256 of a file's raw bytes with CRLF normalized to LF, so a checkout's
+ * line endings don't matter. Works on bytes, so binary files hash correctly.
+ */
+function fileHash(abs) {
+  let buf;
+  try {
+    buf = fs.readFileSync(abs);
+  } catch (_) {
+    return undefined;
+  }
+  const h = crypto.createHash('sha256');
+  let start = 0;
+  for (let i = buf.indexOf(0x0d); i !== -1; i = buf.indexOf(0x0d, i + 1)) {
+    if (buf[i + 1] === 0x0a) { h.update(buf.subarray(start, i)); start = i + 1; }
+  }
+  h.update(buf.subarray(start));
+  return h.digest('hex');
+}
+
+const MAX_SNAPSHOT_FILES = 500;
+
+/**
+ * Hashes of every file git reports as modified, added, deleted or untracked
+ * (deleted → null). Used before and after each shell command to see which
+ * files the command changed.
+ */
+function dirtyHashes(root) {
+  let out;
+  try {
+    out = execFileSync('git', ['status', '--porcelain=v1', '-z', '-uall'], {
+      cwd: root, stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, maxBuffer: 32 * 1024 * 1024,
+    }).toString();
+  } catch (_) {
+    return null; // not a git repo, or git unavailable
+  }
+  const parts = out.split('\0');
+  const files = {};
+  let n = 0;
+  let truncated = false;
+  for (let i = 0; i < parts.length; i++) {
+    const rec = parts[i];
+    if (rec.length < 4) continue;
+    const status = rec.slice(0, 2);
+    const file = rec.slice(3);
+    if (status[0] === 'R' || status[0] === 'C') i++; // skip the original path of a rename/copy
+    if (file.startsWith(DIR_NAME + '/')) continue;
+    if (++n > MAX_SNAPSHOT_FILES) { truncated = true; break; }
+    files[file] = fileHash(path.join(root, file)) || null;
+  }
+  return { files, truncated };
+}
+
+/** Files whose content differs between two dirtyHashes snapshots. */
+function changedBetween(root, before, after) {
+  const changed = {};
+  const all = new Set([...Object.keys(before.files), ...Object.keys(after.files)]);
+  for (const f of all) {
+    const inBefore = Object.prototype.hasOwnProperty.call(before.files, f);
+    const inAfter = Object.prototype.hasOwnProperty.call(after.files, f);
+    const now = inAfter ? after.files[f] : (fileHash(path.join(root, f)) || null);
+    // A file missing from `before` was clean (= HEAD); dirty now means the command changed it.
+    if (!inBefore || before.files[f] !== now) changed[f] = now;
+  }
+  return changed;
+}
+
 function context(p, cwd) {
   return {
     project: path.basename(p.root),
-    cwd: (() => {
-      const rel = path.relative(p.root, cwd);
-      if (path.isAbsolute(rel) || rel === '..' || rel.startsWith('..' + path.sep)) return '<outside project>';
-      return rel.split(path.sep).join('/') || '.';
-    })(),
+    cwd: relPath(p.root, cwd),
     git: { branch: git(['rev-parse', '--abbrev-ref', 'HEAD'], cwd), head: git(['rev-parse', 'HEAD'], cwd) },
   };
 }
@@ -471,13 +612,11 @@ function seal(fields, prev) {
 function append(p, cfg, fields, humanBlock) {
   ensureDir(p);
   return withLock(p, () => {
-    const { items, text } = readItems(p);
-    let lastIdx = -1;
-    for (let i = items.length - 1; i >= 0; i--) if (items[i].entry) { lastIdx = i; break; }
-    let prev = lastIdx >= 0 ? items[lastIdx].entry : null;
-    const badTail = items.slice(lastIdx + 1);
+    const tail = readTail(p);
+    let prev = tail.prev;
+    const badTail = tail.badTail;
 
-    let out = text && !text.endsWith('\n') ? '\n' : ''; // never glue onto a partial line
+    let out = tail.needsNewline ? '\n' : ''; // never glue onto a partial line
     if (badTail.length) {
       const rec = seal({
         type: 'recovery',
@@ -527,6 +666,98 @@ function hookSetup(input) {
   return { cwd, p, cfg };
 }
 
+// ---------------------------------------------------------------- anchoring
+
+/**
+ * Write a snapshot of the chain head. `ots: 'sync'` waits for OpenTimestamps
+ * (CLI), `'background'` fires it detached (hooks), `'none'` skips it.
+ * Returns { file, head, stamped } or null when there is nothing to anchor.
+ */
+function createAnchor(p, { items, text }, ots) {
+  const entries = entriesOf(items);
+  if (!entries.length) return null;
+  const head = entries[entries.length - 1];
+  // Hash exactly the bytes up to and including the head line, from the same
+  // read as `items`, so a concurrent append can't make the two disagree.
+  let headLine = 0;
+  for (let i = items.length - 1; i >= 0; i--) if (items[i].entry) { headLine = items[i].line; break; }
+  const prefix = text.split('\n').slice(0, headLine).join('\n') + '\n';
+  ensureDir(p);
+  fs.mkdirSync(p.anchors, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const file = path.join(p.anchors, `${stamp}-seq${head.seq}.txt`);
+  fs.writeFileSync(file, [
+    'authorship-ledger anchor',
+    `created: ${new Date().toISOString()}`,
+    `entries: ${entries.length}`,
+    `head_seq: ${head.seq}`,
+    `head_ts: ${head.ts}`,
+    `head_hash: ${head.hash}`,
+    `ledger_sha256_to_head: ${sha256(prefix)}`,
+    '',
+  ].join('\n'), { flag: 'wx' });
+  let stamped = false;
+  if (ots === 'sync') {
+    try {
+      execFileSync('ots', ['stamp', file], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000 });
+      stamped = fs.existsSync(file + '.ots');
+    } catch (_) { /* ots not installed or offline */ }
+  } else if (ots === 'background') {
+    try {
+      const child = spawn('ots', ['stamp', file], { detached: true, stdio: 'ignore', windowsHide: true });
+      child.on('error', () => { /* ots not installed */ });
+      child.unref();
+    } catch (_) { /* ignore */ }
+  }
+  return { file, head, stamped };
+}
+
+/**
+ * Anchor automatically — at the end of every session that added entries, and
+ * during long sessions once the last anchor is older than autoAnchorHours —
+ * so the evidence gets external checkpoints without the user remembering to.
+ */
+function maybeAutoAnchor(p, cfg, reason) {
+  if (cfg.autoAnchor === false || !fs.existsSync(p.ledger)) return null;
+  const head = readTail(p).prev;
+  if (!head) return null;
+  const last = latestAnchor(p);
+  if (last && last.seq >= head.seq) return null; // nothing new since the last anchor
+  if (reason !== 'session_end') {
+    const hours = Number(cfg.autoAnchorHours) >= 0 ? Number(cfg.autoAnchorHours) : 24;
+    let since;
+    if (last) {
+      since = last.mtimeMs;
+    } else {
+      const ts = firstEntryTs(p);
+      since = ts ? Date.parse(ts) : Date.now();
+    }
+    if (Date.now() - since < hours * 3600 * 1000) return null;
+  }
+  const read = readItems(p);
+  if (verifyItems(read.items, readAnchors(p)).problems.length) return null; // never anchor a broken chain
+  return createAnchor(p, read, 'background');
+}
+
+/** Timestamp of the first entry, reading only the start of the file when possible. */
+function firstEntryTs(p) {
+  let fd;
+  try {
+    fd = fs.openSync(p.ledger, 'r');
+    const buf = Buffer.alloc(64 * 1024);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    const nl = buf.subarray(0, n).indexOf(0x0a);
+    if (nl !== -1) {
+      const o = JSON.parse(buf.subarray(0, nl).toString('utf8').replace(/\r$/, ''));
+      if (isEntry(o)) return o.ts;
+    }
+  } catch (_) { /* fall through */ } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+  const first = entriesOf(readItems(p).items)[0];
+  return first && first.ts;
+}
+
 // ---------------------------------------------------------------- commands
 
 function cmdRecord() {
@@ -551,6 +782,260 @@ function cmdRecord() {
   }, (e) => `## #${e.seq} — ${e.ts}\n\n`
     + `session \`${e.session_id || '?'}\` · author ${e.author.name || e.author.os_user || '?'}`
     + ` · hash \`${e.hash.slice(0, 16)}…\`\n\n${fence(e.prompt)}\n\n`);
+  maybeAutoAnchor(s.p, s.cfg, 'prompt');
+}
+
+/** SessionEnd hook: anchor whatever the session added. */
+function cmdSessionEnd() {
+  const s = hookSetup(readStdinJson());
+  if (!s) return;
+  maybeAutoAnchor(s.p, s.cfg, 'session_end');
+}
+
+const EDIT_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
+const MAX_COMMAND_CHARS = 2000;
+
+function truncate(text, max) {
+  return text.length > max ? { text: text.slice(0, max), truncated: true } : { text, truncated: undefined };
+}
+
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** Replace the project path with <project> and the home directory with ~ (both slash styles). */
+function scrubPaths(text, root) {
+  let out = text;
+  for (const [dir, token] of [[root, '<project>'], [os.homedir(), '~']]) {
+    if (!dir || dir.length < 3) continue;
+    const variants = new Set([dir, dir.replace(/\\/g, '/'), dir.replace(/\//g, '\\')]);
+    // Git Bash style: C:\Users\x → /c/Users/x
+    const m = dir.match(/^([A-Za-z]):[\\/](.*)$/);
+    if (m) variants.add(`/${m[1].toLowerCase()}/${m[2].replace(/\\/g, '/')}`);
+    for (const v of [...variants].sort((a, b) => b.length - a.length)) {
+      out = out.replace(new RegExp(escapeRe(v), process.platform === 'win32' || m ? 'gi' : 'g'), token);
+    }
+  }
+  return out;
+}
+
+const COMMAND_SECRET_PATTERNS = [
+  [/(\b(?:mysql|mysqldump|mariadb|mariadb-dump)\b[^\n|;&]*?\s-p)(?!\s)\S+/gi, '$1[REDACTED]'],
+  [/(--(?:password|passwd|pass|token|secret|api-key)\s+)(?!-)\S+/gi, '$1[REDACTED]'],
+];
+
+/** Redact a shell command or its description: generic secrets, command flags, paths. */
+function sanitizeCommand(text, root, cfg) {
+  let out = scrubPaths(text, root);
+  let count = 0;
+  if (cfg.redactSecrets) {
+    const r = redact(out);
+    out = r.text;
+    count = r.count;
+    for (const [re, rep] of COMMAND_SECRET_PATTERNS) {
+      out = out.replace(re, (...args) => { count++; return rep.replace('$1', args[1]); });
+    }
+  }
+  return { text: out, count };
+}
+
+function pendingFile(p, input) {
+  const id = String(input.tool_use_id || input.session_id || 'unknown').replace(/[^A-Za-z0-9_-]/g, '_');
+  return path.join(p.dir, '.pending', `${id}.json`);
+}
+
+/** PreToolUse hook (Bash): snapshot dirty files so PostToolUse can tell what the command changed. */
+function cmdToolPre() {
+  const input = readStdinJson();
+  const s = hookSetup(input);
+  if (!s || s.cfg.trackAiActivity === false || input.tool_name !== 'Bash') return;
+  const snap = dirtyHashes(s.p.root);
+  if (!snap) return;
+  ensureDir(s.p);
+  const f = pendingFile(s.p, input);
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, JSON.stringify(snap));
+}
+
+/**
+ * PostToolUse hook: record what Claude itself did. File edits keep only hashes
+ * (the file after the edit, and the text Claude wrote), never the content, so
+ * later changes can be shown not to come from Claude. Shell commands are kept
+ * (redacted, paths scrubbed, truncated) together with the hashes of the files
+ * each command changed, found by comparing git status before and after.
+ */
+function cmdTool() {
+  const input = readStdinJson();
+  const s = hookSetup(input);
+  if (!s || s.cfg.trackAiActivity === false) return;
+  const tool = input.tool_name;
+  const ti = input.tool_input && typeof input.tool_input === 'object' ? input.tool_input : {};
+  let fields;
+  if (tool === 'Bash') {
+    const raw = typeof ti.command === 'string' ? ti.command : '';
+    let before = null;
+    const pf = pendingFile(s.p, input);
+    try { before = JSON.parse(fs.readFileSync(pf, 'utf8')); } catch (_) { /* no snapshot */ }
+    try { fs.unlinkSync(pf); } catch (_) { /* none */ }
+    if (!raw.trim()) return;
+    const red = sanitizeCommand(raw, s.p.root, s.cfg);
+    const desc = typeof ti.description === 'string' ? sanitizeCommand(ti.description, s.p.root, s.cfg) : null;
+    const cmd = truncate(red.text, MAX_COMMAND_CHARS);
+    let filesChanged;
+    let filesTracked = false;
+    if (before && before.files) {
+      const after = dirtyHashes(s.p.root);
+      if (after) {
+        filesChanged = changedBetween(s.p.root, before, after);
+        filesTracked = !(before.truncated || after.truncated);
+      }
+    }
+    fields = {
+      type: 'ai_command',
+      command: cmd.text,
+      truncated: cmd.truncated,
+      redactions: (red.count + (desc ? desc.count : 0)) || undefined,
+      description: desc ? truncate(desc.text, 300).text : undefined,
+      files_changed: filesChanged && Object.keys(filesChanged).length ? filesChanged : undefined,
+      // false = no complete before/after snapshot (not a git repo, too many files, or no PreToolUse)
+      files_tracked: filesTracked,
+    };
+  } else if (EDIT_TOOLS.has(tool)) {
+    const file = ti.file_path || ti.notebook_path;
+    if (typeof file !== 'string' || !file) return;
+    const abs = path.resolve(s.cwd, file);
+    let written;
+    if (tool === 'Write') written = ti.content;
+    else if (tool === 'Edit') written = ti.new_string;
+    else if (tool === 'MultiEdit') written = Array.isArray(ti.edits) ? ti.edits.map((e) => (e && e.new_string) || '').join('\n') : undefined;
+    else written = ti.new_source;
+    fields = {
+      type: 'ai_edit',
+      file: relPath(s.p.root, abs),
+      written_sha256: typeof written === 'string' ? sha256(written) : undefined,
+      written_chars: typeof written === 'string' ? written.length : undefined,
+      file_sha256_after: fileHash(abs),
+    };
+  } else {
+    return;
+  }
+  append(s.p, s.cfg, { ...fields, session_id: input.session_id, tool });
+}
+
+/**
+ * For every file Claude changed — through its file tools or through a shell
+ * command (detected by before/after snapshots) — compare its current content
+ * with the version Claude left behind. Returns rows sorted by path.
+ */
+function attribution(p, entries) {
+  const last = new Map();
+  const touch = (file, hash, e, via) => {
+    if (!file || file === '<outside project>') return;
+    const r = last.get(file) || { file, changes: 0, via: new Set() };
+    r.changes++;
+    r.via.add(via);
+    r.hash = hash;
+    r.lastEntry = e;
+    last.set(file, r);
+  };
+  for (const e of entries) {
+    if (e.type === 'ai_edit') touch(e.file, e.file_sha256_after, e, 'file tool');
+    else if (e.type === 'ai_command' && e.files_changed) {
+      for (const [f, h] of Object.entries(e.files_changed)) touch(f, h, e, 'shell');
+    }
+  }
+  return [...last.values()].sort((a, b) => a.file.localeCompare(b.file)).map((r) => {
+    const now = fileHash(path.join(p.root, r.file));
+    let status;
+    if (now === undefined) status = r.hash === null ? 'deleted-by-claude' : 'deleted';
+    else if (r.hash === undefined) status = 'unknown';
+    else status = now === r.hash ? 'as-claude-left-it' : 'changed-after-claude';
+    return {
+      file: r.file, changes: r.changes, via: [...r.via].join(' + '),
+      lastTs: r.lastEntry.ts, lastSeq: r.lastEntry.seq, status,
+    };
+  });
+}
+
+const STATUS_LABEL = {
+  'as-claude-left-it': "identical to Claude's last recorded change",
+  'changed-after-claude': "changed after Claude's last recorded change",
+  deleted: 'deleted after Claude changed it',
+  'deleted-by-claude': 'deleted by Claude',
+  unknown: 'unknown (no hash recorded)',
+};
+
+/** Git-tracked files with no change by Claude recorded. */
+function untouchedTrackedFiles(p, rows) {
+  const out = git(['ls-files'], p.root);
+  if (!out) return null;
+  const touched = new Set(rows.map((r) => r.file));
+  return out.split('\n').map((f) => f.trim()).filter((f) => f && !f.startsWith(DIR_NAME + '/') && !touched.has(f));
+}
+
+/**
+ * When AI-activity tracking was on: it started with the first session that
+ * reported it (v1.1+) or the first AI entry; sessions that reported it off
+ * are gaps. Everything before the start is unknown.
+ */
+function trackingCoverage(entries) {
+  let since = null;
+  const offSessions = [];
+  const commandsWithoutFiles = entries.filter((e) => e.type === 'ai_command' && e.files_tracked === false).length;
+  for (const e of entries) {
+    const on = (e.type === 'session_start' && e.settings && e.settings.trackAiActivity === true)
+      || e.type === 'ai_edit' || e.type === 'ai_command';
+    if (!since && on) since = e;
+    if (e.type === 'session_start' && e.settings && e.settings.trackAiActivity === false) offSessions.push(e);
+  }
+  const promptsBefore = entries.filter((e) => e.type === 'prompt' && (!since || e.seq < since.seq)).length;
+  return { since, offSessions, promptsBefore, commandsWithoutFiles };
+}
+
+function coverageLines(cov) {
+  const lines = [];
+  if (!cov.since) {
+    lines.push('AI-activity tracking: no tracked session recorded — Claude\'s changes are unknown for the whole ledger.');
+  } else {
+    lines.push(`AI-activity tracking since entry #${cov.since.seq} (${cov.since.ts}).`);
+    if (cov.promptsBefore) lines.push(`${cov.promptsBefore} prompt(s) were recorded before that: what Claude changed in that period is unknown.`);
+  }
+  if (cov.offSessions.length) lines.push(`Tracking was turned OFF in ${cov.offSessions.length} session(s): ${cov.offSessions.map((e) => `#${e.seq} ${e.ts}`).join(', ')}.`);
+  if (cov.commandsWithoutFiles) lines.push(`${cov.commandsWithoutFiles} shell command(s) ran without a complete before/after snapshot (not a git repo or too many changed files): files they changed are not attributed.`);
+  return lines;
+}
+
+const ATTRIBUTION_CAVEAT = 'What this shows: for each file, whether it is still exactly what Claude\'s last recorded change left (through its file tools, or through a shell command, detected by comparing git status before and after). "Changed after" means something other than Claude\'s recorded changes altered the file — you, a formatter, another tool or another person; your git history shows who and when. Files with no recorded change by Claude are not proof of human authorship: changes before tracking began, by other tools, generated files or other people\'s commits are all counted there.';
+
+function cmdAttribution() {
+  const p = paths();
+  const entries = entriesOf(readItems(p).items);
+  const rows = attribution(p, entries);
+  const commands = entries.filter((e) => e.type === 'ai_command').length;
+  console.log(`Ledger: ${p.ledger}`);
+  coverageLines(trackingCoverage(entries)).forEach((l) => console.log(l));
+  if (!rows.length) {
+    console.log('No file changes by Claude recorded.');
+  } else {
+    console.log(`Files changed by Claude: ${rows.length}`);
+    for (const r of rows) console.log(`  ${r.file} — ${r.changes} change(s) via ${r.via}, last ${r.lastTs} — ${STATUS_LABEL[r.status]}`);
+  }
+  const untouched = untouchedTrackedFiles(p, rows);
+  if (untouched) console.log(`Git-tracked files with no change by Claude recorded since tracking began: ${untouched.length}`);
+  console.log(`Shell commands run by Claude: ${commands}`);
+  console.log('');
+  console.log(ATTRIBUTION_CAVEAT);
+  return 0;
+}
+
+let pluginVersionCache;
+function pluginVersion() {
+  if (pluginVersionCache === undefined) {
+    try {
+      pluginVersionCache = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '.claude-plugin', 'plugin.json'), 'utf8')).version;
+    } catch (_) {
+      pluginVersionCache = null;
+    }
+  }
+  return pluginVersionCache || undefined;
 }
 
 function cmdSession() {
@@ -565,6 +1050,12 @@ function cmdSession() {
     author: author(s.cwd, s.cfg),
     ...context(s.p, s.cwd),
     tool: 'claude-code',
+    // So reports can tell "Claude changed nothing" from "tracking was off".
+    settings: {
+      plugin_version: pluginVersion(),
+      trackAiActivity: s.cfg.trackAiActivity !== false,
+      autoAnchor: s.cfg.autoAnchor !== false,
+    },
   }, (e) => `---\n\n### Session \`${e.session_id || '?'}\` started — ${e.ts}`
     + `${e.source ? ` (${e.source})` : ''}${e.model ? ` · model ${e.model}` : ''}\n\n`);
 }
@@ -595,8 +1086,24 @@ function cmdVerify() {
     console.log(`Last:   ${entries[entries.length - 1].ts}`);
     console.log(`Head hash: ${entries[entries.length - 1].hash}`);
   }
-  if (!anchors.length) console.log('Note: no anchors yet — run /authorship-ledger:anchor so truncation and rewrites become detectable.');
+  if (!anchors.length) {
+    console.log('Note: no anchors yet — run /authorship-ledger:anchor so truncation and rewrites become detectable.');
+  } else {
+    const missing = anchorsWithoutOts(p);
+    if (missing) {
+      console.log(`Note: ${missing} of ${anchors.length} anchor(s) have no OpenTimestamps proof (.ots). Local anchor files`
+        + ' can be deleted or regenerated along with the ledger; only .ots proofs, a pushed commit or a copy held by'
+        + ' someone else are independent of your machine.');
+    }
+  }
   return problems.length ? 1 : 0;
+}
+
+function anchorsWithoutOts(p) {
+  let files = [];
+  try { files = fs.readdirSync(p.anchors); } catch (_) { return 0; }
+  const set = new Set(files);
+  return files.filter((f) => f.endsWith('.txt') && !set.has(f + '.ots')).length;
 }
 
 function cmdStatus() {
@@ -614,8 +1121,12 @@ function cmdStatus() {
     console.log(`Span:     ${entries[0].ts} → ${head.ts}`);
     console.log(`Head:     ${head.hash}`);
   }
+  const edits = entries.filter((e) => e.type === 'ai_edit').length;
+  const commands = entries.filter((e) => e.type === 'ai_command').length;
+  console.log(`AI activity: ${cfg.trackAiActivity === false ? 'not tracked' : `${edits} file edits, ${commands} shell commands`}`);
   const anchors = readAnchors(p);
-  console.log(`Anchors:  ${anchors.length}${anchors.length ? ' (latest ' + anchors[anchors.length - 1].file + ')' : ''}`);
+  console.log(`Anchors:  ${anchors.length}${anchors.length ? ' (latest ' + anchors[anchors.length - 1].file + ')' : ''}`
+    + `, ${anchorsWithoutOts(p)} without OpenTimestamps proof · auto-anchor ${cfg.autoAnchor === false ? 'off' : 'on'}`);
   return 0;
 }
 
@@ -654,6 +1165,11 @@ function cmdReport() {
   out.push(`| Integrity | ${problems.length ? '**FAILED** (' + problems.length + ' problems)' : 'hash chain intact, anchors match'}${warnings.length ? `, ${warnings.length} warning(s)` : ''} |`);
   out.push(`| Chain head (SHA-256) | \`${head ? head.hash : 'n/a'}\` |`);
   out.push(`| External anchors | ${anchors.length} snapshot(s), ${otsCount} OpenTimestamps proof(s) |`);
+  const rows = attribution(p, entries);
+  const aiCommands = entries.filter((e) => e.type === 'ai_command');
+  const cov = trackingCoverage(entries);
+  out.push(`| AI activity recorded | ${entries.filter((e) => e.type === 'ai_edit').length} file edits and ${aiCommands.length} shell commands, changing ${rows.length} file(s)`
+    + `${cov.since ? ` — tracked since #${cov.since.seq}` : ' — not tracked'} |`);
   out.push('');
   if (problems.length || warnings.length) {
     out.push('### Integrity findings', '');
@@ -663,7 +1179,7 @@ function cmdReport() {
   }
   out.push('## What this evidence shows — and what it does not', '');
   out.push('- Each line of `.authorship/ledger.jsonl` is a JSON entry whose `hash` is the SHA-256 of its other fields serialized with recursively sorted keys; `prev_hash` links it to the preceding entry. Editing, deleting or reordering an entry breaks the chain.');
-  out.push('- Removing the newest entries or rebuilding the whole chain is only detectable against an anchor made earlier (`.authorship/anchors/`, optionally stamped with OpenTimestamps), the git history, or a copy held by a third party. Dates are only as trustworthy as those external anchors.');
+  out.push('- Removing the newest entries or rebuilding the whole chain is only detectable against an anchor made earlier, the git history, or a copy held by a third party. Anchor files in `.authorship/anchors/` live next to the ledger and could be regenerated with it; only their OpenTimestamps proofs (`.ots`), pushed commits or third-party copies are independent. Dates are only as trustworthy as those.');
   out.push('- To re-check: run `node scripts/ledger.js verify` from the authorship-ledger plugin (or re-implement the rule above), and `ots verify <file>.ots` for each proof.');
   out.push('');
   out.push('## Timeline of human prompts', '');
@@ -675,6 +1191,24 @@ function cmdReport() {
       out.push(fence(e.prompt), '');
     }
   }
+  out.push('## AI activity and file attribution', '');
+  coverageLines(cov).forEach((l) => out.push(`- ${l}`));
+  out.push('');
+  if (rows.length) {
+    out.push('Files Claude changed, compared with their current content:', '');
+    out.push('| File | Claude changes | Via | Last Claude change | Current state |', '|---|---|---|---|---|');
+    for (const r of rows) out.push(`| \`${r.file}\` | ${r.changes} | ${r.via} | ${r.lastTs} (#${r.lastSeq}) | ${STATUS_LABEL[r.status]} |`);
+    out.push('');
+  } else {
+    out.push('No file changes by Claude recorded.', '');
+  }
+  const untouched = untouchedTrackedFiles(p, rows);
+  if (untouched) {
+    out.push(`Git-tracked files with no change by Claude recorded since tracking began: **${untouched.length}**`
+      + (untouched.length && untouched.length <= 50 ? ' — ' + untouched.map((f) => `\`${f}\``).join(', ') : ''), '');
+  }
+  out.push(`Shell commands run by Claude: ${aiCommands.length} (full list in \`ledger.jsonl\`, type \`ai_command\`).`, '');
+  out.push(`_${ATTRIBUTION_CAVEAT}_`, '');
   out.push('---', '');
   out.push('_This report documents the human direction given to an AI assistant. It is technical evidence, not legal advice. Copyright protects expression, not ideas, and in several jurisdictions prompts alone may not be enough for authorship; this record is strongest alongside your own edits and design work._', '');
 
@@ -695,28 +1229,9 @@ function cmdAnchor() {
   if (!entries.length) { console.log('Nothing to anchor: the ledger is empty.'); return 0; }
   const { problems } = verifyItems(items, readAnchors(p));
   if (problems.length) { console.log('Refusing to anchor: integrity check failed. Run verify.'); return 1; }
-  const head = entries[entries.length - 1];
-  ensureDir(p);
-  fs.mkdirSync(p.anchors, { recursive: true });
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const file = path.join(p.anchors, `${stamp}-seq${head.seq}.txt`);
-  fs.writeFileSync(file, [
-    'authorship-ledger anchor',
-    `created: ${new Date().toISOString()}`,
-    `entries: ${entries.length}`,
-    `head_seq: ${head.seq}`,
-    `head_ts: ${head.ts}`,
-    `head_hash: ${head.hash}`,
-    `ledger_sha256: ${sha256(fs.readFileSync(p.ledger, 'utf8'))}`,
-    '',
-  ].join('\n'));
+  const { file, head, stamped } = createAnchor(p, readItems(p), 'sync');
   console.log(`Anchor snapshot: ${file}`);
   console.log(`Head hash: ${head.hash}`);
-  let stamped = false;
-  try {
-    execFileSync('ots', ['stamp', file], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000 });
-    stamped = fs.existsSync(file + '.ots');
-  } catch (_) { /* ots not installed or offline */ }
   if (stamped) {
     console.log(`OpenTimestamps proof: ${file}.ots (Bitcoin confirmation takes a few hours; run \`ots upgrade\` later)`);
   } else {
@@ -751,8 +1266,12 @@ function cmdCheck() {
 
 // ---------------------------------------------------------------- main
 
-const HOOK_CMDS = { record: cmdRecord, session: cmdSession };
-const CLI_CMDS = { verify: cmdVerify, status: cmdStatus, report: cmdReport, anchor: cmdAnchor, check: cmdCheck };
+const HOOK_CMDS = {
+  record: cmdRecord, session: cmdSession, 'session-end': cmdSessionEnd, tool: cmdTool, 'tool-pre': cmdToolPre,
+};
+const CLI_CMDS = {
+  verify: cmdVerify, status: cmdStatus, report: cmdReport, anchor: cmdAnchor, check: cmdCheck, attribution: cmdAttribution,
+};
 
 module.exports = { canonical, entryHash, verifyItems, redact, sha256 };
 
@@ -768,7 +1287,8 @@ if (require.main === module) {
   } else if (CLI_CMDS[cmd]) {
     process.exit(CLI_CMDS[cmd]() || 0);
   } else {
-    console.log('usage: ledger.js <record|session|verify|status|report [--out file]|anchor|check <seq>> [--project dir]');
+    console.log('usage: ledger.js <verify|status|report [--out file]|anchor|attribution|check <seq>> [--project dir]');
+    console.log('hooks: record | session | session-end | tool | tool-pre');
     process.exit(cmd ? 2 : 0);
   }
 }

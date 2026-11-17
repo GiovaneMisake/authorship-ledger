@@ -16,11 +16,12 @@ Authorship Ledger captures them **as you type**, in your project, in a format de
 
 - 📝 **Every prompt, automatically** — a `UserPromptSubmit` hook appends each prompt with timestamp, session, author (git identity), branch and commit.
 - 🔗 **Hash-chained** — each entry contains the SHA-256 of the previous one, so editing, deleting or reordering entries breaks the chain and `verify` reports it.
-- ⏱️ **Anchors & trusted timestamps** — `anchor` snapshots the chain head; `verify` checks every snapshot, so truncation or a rewritten chain is caught too. With the free [OpenTimestamps](https://opentimestamps.org) client the snapshot is stamped on the Bitcoin blockchain.
-- 📄 **Authorship report** — one command produces a Markdown report: summary, integrity status, timeline of your prompts and a narrative of your creative contribution.
+- ⏱️ **Automatic anchors & trusted timestamps** — a snapshot of the chain head is taken at the end of every session (and every 24 h in long sessions), with no action needed. `verify` checks every snapshot, so truncation or a rewritten chain is caught too. If the free [OpenTimestamps](https://opentimestamps.org) client is installed, each snapshot is also stamped on the Bitcoin blockchain.
+- 🤖 **What Claude changed, file by file** — Claude's file edits are recorded as hashes (never content). Its shell commands are recorded too, together with the hashes of the files each command changed, found by comparing git status before and after. `attribution` then shows which files are still exactly as Claude's last recorded change left them and which were changed afterwards. Your git history shows who made those later changes. Your hands-on changes to the output matter a lot for copyright, and this shows where they can be.
+- 📄 **Authorship report** — one command produces a Markdown report: summary, integrity status, timeline of your prompts, file attribution and a narrative of your creative contribution.
 - 🧯 **Crash-safe & append-only** — an interrupted write never stops recording: the next prompt adds a `recovery` entry documenting the damaged bytes. Existing lines are never rewritten.
-- 🔒 **Local & private** — no network. Common secret formats (API keys, tokens, JWTs, private keys, passwords in config or URLs) are redacted before writing.
-- 🪶 **Zero dependencies** — one Node.js script. It adds roughly 0.1–0.3 s per prompt, prints nothing to Claude's context and never makes your prompt fail.
+- 🔒 **Local & private** — nothing leaves your machine. The one exception: if you install the OpenTimestamps client, the hash of each anchor snapshot (never its content) is sent to OpenTimestamps servers. Common secret formats (API keys, tokens, JWTs, private keys, passwords in config or URLs) are redacted before writing.
+- 🪶 **Zero dependencies** — one Node.js script. Each hook takes roughly 0.1–0.2 s; shell commands run two of them (a git status before and after). The hooks print nothing to Claude's context and never make a prompt or tool call fail.
 
 ## Install
 
@@ -42,7 +43,8 @@ Requires Node.js ≥ 18 on your `PATH`.
 | `/authorship-ledger:status` | Where the ledger is, whether recording is on, how many prompts/sessions/anchors |
 | `/authorship-ledger:verify` | Recomputes the whole hash chain, checks every anchor, reports any tampering |
 | `/authorship-ledger:report [file]` | Writes the Human Authorship Report (default `.authorship/AUTHORSHIP-REPORT.md`) |
-| `/authorship-ledger:anchor` | Snapshots the chain head; stamps it with OpenTimestamps if `ots` is installed |
+| `/authorship-ledger:anchor` | Snapshots the chain head now (it also happens automatically); stamps it with OpenTimestamps if `ots` is installed |
+| `/authorship-ledger:attribution` | Files Claude changed (file tools or shell): identical to Claude's last change, changed afterwards, or deleted, plus since when tracking covers the project |
 
 You can also just ask Claude: *"generate a report documenting my authorship of this project"*.
 
@@ -69,6 +71,16 @@ A ledger entry:
  "prev_hash":"…","hash":"…"}
 ```
 
+Claude's activity, in the same chain:
+
+```json
+{"seq":43,"type":"ai_edit","tool":"Edit","file":"src/shop.js","written_sha256":"…","written_chars":812,
+ "file_sha256_after":"…","session_id":"…","prev_hash":"…","hash":"…", …}
+{"seq":44,"type":"ai_command","tool":"Bash","command":"npm test","description":"Run tests", …}
+```
+
+`file_sha256_after` is the SHA-256 of the whole file right after Claude's edit, with CRLF normalized to LF so line-ending changes don't count.
+
 `hash = SHA-256(canonical JSON of the entry without "hash")` with keys sorted recursively, so anyone can re-implement the verifier in a few lines.
 
 Prompts that had secrets redacted carry no plain `prompt_sha256` (it would let someone brute-force a short password). They carry a `prompt_hmac` keyed by a random local secret in `~/.config/authorship-ledger/key`, which never goes into the ledger, so **you** can still prove the exact original text, for example from Claude Code's transcript:
@@ -82,13 +94,19 @@ Back that key file up privately; without it redacted prompts can't be matched.
 ## What it proves — and what it doesn't
 
 - ✅ **Internal consistency.** Changing, removing or reordering any entry *before the newest one* breaks the chain.
-- ✅ **Nothing changed since an anchor.** If the newest entries are deleted, or someone rebuilds the entire chain with forged content, `verify` catches it **only by comparing against an anchor made earlier** — so anchor regularly.
+- ✅ **Nothing changed since an anchor.** If the newest entries are deleted, or someone rebuilds the entire chain with forged content, `verify` catches it **only by comparing against an anchor made earlier**. Anchors are taken automatically at the end of each session. ⚠️ An anchor file sits next to the ledger, so whoever rewrites the ledger could regenerate the anchors too. Only an OpenTimestamps proof (`.ots`), a pushed commit or a copy held by someone else is independent of your machine. `verify` and `status` tell you how many anchors lack an `.ots` proof. Background stamping fails silently when `ots` isn't on the PATH or you are offline.
+- ✅ **Which files are still exactly what Claude left.** `attribution` compares each file with Claude's last recorded change, whether made with its file tools or with a shell command. ⚠️ What it can't tell you:
+  - *who* changed a file afterwards: you, a formatter, another tool, or a teammate. Your git history answers that.
+  - anything from before tracking began, for example a ledger started with v1.0. The report states since when tracking covers the project, and in which sessions it was off.
+  - shell changes outside a git repo, or commands that touched more than 500 files.
+
+  "No change by Claude recorded" is therefore **not** proof that a file is human-written.
 - ❌ **Dates on their own.** Timestamps in the file are written by your computer. Trust in *when* comes from things outside your control: OpenTimestamps proofs, a git remote's history, or a copy sent to a third party.
 - ❌ **Authorship on its own.** Copyright protects *expression*, not ideas. The [US Copyright Office (2025)](https://www.copyright.gov/ai/) concluded that prompts alone generally do not give enough control over the output to make the user its author; what counts is human expressive input, selection/arrangement and modification. Italy's AI law (L. 132/2025) likewise protects works that result from the author's intellectual effort, even when made with AI tools. The ledger documents your creative direction — it is strongest **together with** your own edits and design work in git.
 
 ## Making the evidence strong
 
-1. **Anchor at milestones** — `/authorship-ledger:anchor` before publishing, sending work to a client, or a release. `pip install opentimestamps-client` enables free Bitcoin-anchored proofs.
+1. **Install the OpenTimestamps client** (`pip install opentimestamps-client`). Then every automatic anchor also gets a free Bitcoin-anchored proof. Run `/authorship-ledger:anchor` by hand at milestones too: before publishing, before sending work to a client, at a release.
 2. **Keep a copy you don't control** — push it to a remote, and for high stakes send the head hash to a third party (e-mail to yourself and a lawyer, a notary, or a PEC message in Italy).
 3. **Keep your own edits in git**, so your hands-on contribution is documented too.
 
@@ -116,7 +134,10 @@ Create `.authorship/config.json` (all optional, defaults shown):
   "redactSecrets": true,
   "recordAuthorEmail": true,
   "recordMachineInfo": true,
-  "humanReadableLog": true
+  "humanReadableLog": true,
+  "trackAiActivity": true,
+  "autoAnchor": true,
+  "autoAnchorHours": 24
 }
 ```
 
@@ -126,6 +147,9 @@ Create `.authorship/config.json` (all optional, defaults shown):
 | `recordAuthorEmail: false` | Don't store your git e-mail |
 | `recordMachineInfo: false` | Don't store OS user name and host name |
 | `humanReadableLog: false` | Don't write `PROMPTS.md` |
+| `trackAiActivity: false` | Don't record Claude's file edits and shell commands |
+| `autoAnchor: false` | Only anchor when you run `/authorship-ledger:anchor` |
+| `autoAnchorHours` | In long sessions, anchor when the last anchor is older than this (default 24) |
 
 Environment variables: `AUTHORSHIP_LEDGER_DIR` (ledger location), `AUTHORSHIP_LEDGER_KEY_FILE` (HMAC key location), `AUTHORSHIP_LEDGER_DISABLED=1` (turn recording off everywhere), `AUTHORSHIP_LEDGER_DEBUG=1` (print hook errors to stderr).
 
@@ -133,7 +157,11 @@ Redaction is pattern-based and best-effort: it covers the common formats listed 
 
 ## FAQ
 
-**Does it record Claude's answers?** No — only what *you* typed. Claude Code keeps full transcripts separately in `~/.claude/projects/`.
+**Doesn't Claude Code already keep transcripts?** Yes, in `~/.claude/projects/`. But they are deleted after 30 days by default (`cleanupPeriodDays`), live outside your project, are plain files anyone can edit unnoticed, and mix your words with Claude's. The ledger is permanent, sits in the project, is tamper-evident and anchored, and separates what you asked from what Claude did. Keeping transcripts longer (raise `cleanupPeriodDays`) is a good complement: with `check` you can match a redacted prompt against them.
+
+**Does it record Claude's answers?** Not the text. It records what Claude *did*: which files it edited (as hashes) and which commands it ran.
+
+**Does auto-anchoring leave processes running?** When `ots` is installed, each automatic anchor starts a detached `ots stamp` that ends by itself once the OpenTimestamps calendars answer or time out. If you are offline often, you may see a few of them linger. Set `autoAnchor: false` and anchor by hand if you'd rather not.
 
 **Multiple sessions at once?** A file lock keeps one consistent chain across parallel sessions; a lock left behind by a crashed process is detected and cleared.
 
@@ -159,8 +187,9 @@ Authorship Ledger li salva **mentre scrivi**, nel tuo progetto:
 
 - 📝 **Ogni richiesta, automaticamente**, con data/ora, sessione, autore (identità git), branch e commit.
 - 🔗 **Catena di hash SHA-256**: modifiche, cancellazioni o riordini rompono la catena e `verify` li segnala.
-- ⏱️ **Ancoraggi e marca temporale** gratuita sulla blockchain Bitcoin tramite [OpenTimestamps](https://opentimestamps.org) con `anchor`; `verify` confronta il registro con ogni ancoraggio.
-- 📄 **Report di paternità** in Markdown con cronologia dei prompt e sintesi del tuo contributo creativo.
+- ⏱️ **Ancoraggi automatici** a fine sessione (e ogni 24 ore nelle sessioni lunghe), con marca temporale gratuita sulla blockchain Bitcoin tramite [OpenTimestamps](https://opentimestamps.org) se il client è installato; `verify` confronta il registro con ogni ancoraggio.
+- 🤖 **Cosa ha fatto Claude e cosa hai fatto tu**: le modifiche di Claude ai file vengono registrate come impronte (mai il contenuto), insieme ai comandi che esegue. Registra anche, per ogni comando, quali file ha cambiato. `attribution` mostra file per file cosa è ancora esattamente come l'ha lasciato Claude e cosa è stato cambiato dopo; chi l'ha cambiato lo dice la tua storia git. Non è una prova che un file sia scritto da un umano: vale solo da quando il tracciamento è attivo, e il report indica da quando.
+- 📄 **Report di paternità** in Markdown con cronologia dei prompt, attribuzione dei file e sintesi del tuo contributo creativo.
 - 🔒 **Locale e privato**: nessuna connessione di rete; chiavi, token e password nei formati comuni vengono oscurati.
 
 ### Installazione
@@ -175,7 +204,8 @@ Authorship Ledger li salva **mentre scrivi**, nel tuo progetto:
 - `/authorship-ledger:status` — stato del registro
 - `/authorship-ledger:verify` — verifica la catena e gli ancoraggi
 - `/authorship-ledger:report` — genera il report di paternità
-- `/authorship-ledger:anchor` — fissa lo stato attuale con una marca temporale
+- `/authorship-ledger:anchor` — fissa subito lo stato attuale con una marca temporale (avviene anche in automatico)
+- `/authorship-ledger:attribution` — quali file sono ancora come li ha lasciati Claude e quali hai cambiato tu
 
 ### Cosa dimostra (e cosa no)
 

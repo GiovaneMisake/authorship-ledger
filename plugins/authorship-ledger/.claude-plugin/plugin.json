@@ -1,6 +1,6 @@
 {
   "name": "authorship-ledger",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Protect your authorship when coding with AI: every prompt you type is logged to a tamper-evident, hash-chained ledger in your project, with reports and optional blockchain timestamps as evidence of your ideation.",
   "author": {
     "name": "GiovaneMisake",

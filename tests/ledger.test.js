@@ -270,12 +270,12 @@ test('recording can be disabled per project or by env', () => {
 test('parallel writers keep one consistent chain', async () => {
   const dir = tmpProject();
   const env = baseEnv({ CLAUDE_PROJECT_DIR: dir });
-  await Promise.all(Array.from({ length: 12 }, (_, i) => new Promise((resolve) => {
+  await Promise.all(Array.from({ length: 24 }, (_, i) => new Promise((resolve) => {
     const c = spawn(process.execPath, [SCRIPT, 'record'], { cwd: dir, env });
     c.on('exit', resolve);
     c.stdin.end(JSON.stringify({ cwd: dir, session_id: 'p' + i, prompt: 'parallel ' + i }));
   })));
-  assert.strictEqual(lines(dir).length, 12);
+  assert.strictEqual(lines(dir).length, 24);
   assert.strictEqual(run(dir, ['verify']).status, 0);
 });
 
@@ -291,6 +291,200 @@ test('report and anchor', () => {
   assert.match(md, /Human Authorship Report/);
   assert.match(md, /idea for report/);
   assert.match(md, /1 snapshot/);
+});
+
+const toolHook = (dir, tool_name, tool_input, opts) => hook(dir, 'tool', { tool_name, tool_input }, opts);
+const anchorFiles = (dir) => {
+  try { return fs.readdirSync(path.join(dir, '.authorship', 'anchors')).filter((f) => f.endsWith('.txt')); } catch (_) { return []; }
+};
+
+test('records Claude edits (hashes only) and shell commands', () => {
+  const dir = tmpProject();
+  const file = path.join(dir, 'src', 'game.js');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, 'const secretSauce = 42;\r\n');
+  const r = toolHook(dir, 'Write', { file_path: file, content: 'const secretSauce = 42;\n' });
+  assert.strictEqual(r.stdout, '');
+  toolHook(dir, 'Bash', { command: 'curl -H "Authorization: Bearer abcdef1234567890abcdef" x', description: 'call api' });
+  toolHook(dir, 'Read', { file_path: file }); // ignored
+  const es = entries(dir);
+  assert.deepStrictEqual(es.map((e) => e.type), ['ai_edit', 'ai_command']);
+  assert.strictEqual(es[0].file, 'src/game.js');
+  assert.strictEqual(es[0].file_sha256_after, crypto.createHash('sha256').update('const secretSauce = 42;\n').digest('hex'));
+  assert.ok(!JSON.stringify(es[0]).includes('secretSauce'));
+  assert.match(es[1].command, /Bearer \[REDACTED\]/);
+  assert.strictEqual(run(dir, ['verify']).status, 0);
+});
+
+test('attribution separates files changed after Claude', () => {
+  const dir = tmpProject();
+  execFileSync('git', ['init', '-q'], { cwd: dir });
+  const w = (name, text) => { fs.writeFileSync(path.join(dir, name), text); return path.join(dir, name); };
+  toolHook(dir, 'Write', { file_path: w('ai.js', 'ai code\n'), content: 'ai code\n' });
+  toolHook(dir, 'Edit', { file_path: w('mixed.js', 'ai code\n'), old_string: 'x', new_string: 'ai code' });
+  toolHook(dir, 'Write', { file_path: w('gone.js', 'tmp\n'), content: 'tmp\n' });
+  w('mixed.js', 'ai code\nplus my own work\n');
+  fs.unlinkSync(path.join(dir, 'gone.js'));
+  w('human.js', 'written by hand\n');
+  execFileSync('git', ['add', 'ai.js', 'mixed.js', 'human.js'], { cwd: dir });
+  const a = run(dir, ['attribution']);
+  assert.strictEqual(a.status, 0, a.stdout);
+  assert.match(a.stdout, /ai\.js — 1 change\(s\) via file tool.*identical to Claude's last recorded change/);
+  assert.match(a.stdout, /mixed\.js — 1 change\(s\) via file tool.*changed after Claude's last recorded change/);
+  assert.match(a.stdout, /gone\.js.*deleted after Claude changed it/);
+  assert.match(a.stdout, /no change by Claude recorded since tracking began: 1/);
+  run(dir, ['report']);
+  const md = fs.readFileSync(path.join(dir, '.authorship', 'AUTHORSHIP-REPORT.md'), 'utf8');
+  assert.match(md, /AI activity and file attribution/);
+  assert.match(md, /`human\.js`/);
+});
+
+test('shell commands: files they change are attributed to Claude, earlier human edits are not', () => {
+  const dir = tmpProject();
+  const g = (...a) => execFileSync('git', a, { cwd: dir, stdio: 'ignore' });
+  g('init', '-q');
+  g('config', 'user.email', 't@t'); g('config', 'user.name', 't');
+  fs.writeFileSync(path.join(dir, 'a.txt'), 'original\n');
+  fs.writeFileSync(path.join(dir, 'mine.txt'), 'original\n');
+  g('add', '.'); g('commit', '-qm', 'init');
+  fs.writeFileSync(path.join(dir, 'mine.txt'), 'edited by the human before the command\n');
+
+  const payload = { tool_name: 'Bash', tool_use_id: 'tu1', tool_input: { command: 'sed -i s/original/by-claude/ a.txt' } };
+  hook(dir, 'tool-pre', payload);
+  fs.writeFileSync(path.join(dir, 'a.txt'), 'by-claude\n'); // what the command does
+  fs.writeFileSync(path.join(dir, 'new.txt'), 'created by the command\n');
+  hook(dir, 'tool', payload);
+
+  const e = entries(dir).find((x) => x.type === 'ai_command');
+  assert.strictEqual(e.files_tracked, true);
+  assert.deepStrictEqual(Object.keys(e.files_changed).sort(), ['a.txt', 'new.txt']);
+  assert.ok(!fs.existsSync(path.join(dir, '.authorship', '.pending', 'tu1.json')));
+  const a = run(dir, ['attribution']);
+  assert.match(a.stdout, /a\.txt — 1 change\(s\) via shell.*identical/);
+  assert.ok(!/mine\.txt — /.test(a.stdout), a.stdout);
+  fs.writeFileSync(path.join(dir, 'a.txt'), 'by-claude\nthen improved by hand\n');
+  assert.match(run(dir, ['attribution']).stdout, /a\.txt — .*changed after Claude's last recorded change/);
+});
+
+test('shell commands: secrets and local paths are scrubbed', () => {
+  const dir = tmpProject();
+  const home = os.homedir();
+  const command = `cd "${dir}" && mysql -u root -pHunter2pass db && export DB_PASS=abcdefgh && cat "${path.join(home, 'notes.txt')}" && tool --password s3cr3tvalue`;
+  toolHook(dir, 'Bash', { command, description: 'login with password=hunter22' });
+  const e = entries(dir)[0];
+  for (const leaked of ['Hunter2pass', 'abcdefgh', 's3cr3tvalue', 'hunter22', dir, home]) {
+    assert.ok(!e.command.includes(leaked) && !e.description.includes(leaked), `leaked ${leaked}: ${e.command} | ${e.description}`);
+  }
+  assert.match(e.command, /cd "<project>"/);
+  assert.match(e.command, /~[\\/]notes\.txt/);
+});
+
+test('reports say when AI activity was not tracked (e.g. ledgers from v1.0)', () => {
+  const dir = tmpProject();
+  hook(dir, 'record', { prompt: 'old prompt, before v1.1' });
+  let a = run(dir, ['attribution']);
+  assert.match(a.stdout, /no tracked session recorded/);
+  hook(dir, 'session', { source: 'startup' });
+  hook(dir, 'record', { prompt: 'new prompt' });
+  a = run(dir, ['attribution']);
+  assert.match(a.stdout, /tracking since entry #2/);
+  assert.match(a.stdout, /1 prompt\(s\) were recorded before that/);
+  const dir2 = tmpProject();
+  fs.mkdirSync(path.join(dir2, '.authorship'));
+  fs.writeFileSync(path.join(dir2, '.authorship', 'config.json'), '{"trackAiActivity": false}');
+  hook(dir2, 'session', { source: 'startup' });
+  assert.match(run(dir2, ['attribution']).stdout, /turned OFF in 1 session/);
+});
+
+test('verify points out anchors without an OpenTimestamps proof', () => {
+  const dir = tmpProject();
+  hook(dir, 'record', { prompt: 'x' });
+  run(dir, ['anchor']);
+  const v = run(dir, ['verify']);
+  assert.strictEqual(v.status, 0);
+  assert.match(v.stdout, /1 of 1 anchor\(s\) have no OpenTimestamps proof/);
+  const txt = fs.readFileSync(path.join(dir, '.authorship', 'anchors', anchorFiles(dir)[0]), 'utf8');
+  const prefix = fs.readFileSync(ledgerOf(dir), 'utf8');
+  assert.ok(txt.includes(`ledger_sha256_to_head: ${crypto.createHash('sha256').update(prefix).digest('hex')}`));
+});
+
+test('file hashes are binary-safe and ignore CRLF', () => {
+  const dir = tmpProject();
+  const a = path.join(dir, 'a.bin');
+  const b = path.join(dir, 'b.bin');
+  fs.writeFileSync(a, Buffer.from([0xff, 0xfe, 0x00, 0x01]));
+  fs.writeFileSync(b, Buffer.from([0xfe, 0xff, 0x00, 0x01]));
+  toolHook(dir, 'Write', { file_path: a, content: 'x' });
+  toolHook(dir, 'Write', { file_path: b, content: 'x' });
+  const [ea, eb] = entries(dir);
+  assert.notStrictEqual(ea.file_sha256_after, eb.file_sha256_after);
+  const c = path.join(dir, 'c.txt');
+  fs.writeFileSync(c, 'l1\r\nl2\r\n');
+  toolHook(dir, 'Write', { file_path: c, content: 'x' });
+  assert.strictEqual(entries(dir)[2].file_sha256_after, crypto.createHash('sha256').update('l1\nl2\n').digest('hex'));
+});
+
+test('AI tracking can be turned off', () => {
+  const dir = tmpProject();
+  fs.mkdirSync(path.join(dir, '.authorship'));
+  fs.writeFileSync(path.join(dir, '.authorship', 'config.json'), '{"trackAiActivity": false}');
+  toolHook(dir, 'Bash', { command: 'ls' });
+  assert.ok(!fs.existsSync(ledgerOf(dir)));
+});
+
+test('auto-anchor at session end, only when there is something new', () => {
+  const dir = tmpProject();
+  hook(dir, 'record', { prompt: 'idea' });
+  assert.strictEqual(anchorFiles(dir).length, 0);
+  hook(dir, 'session-end', {});
+  assert.strictEqual(anchorFiles(dir).length, 1);
+  hook(dir, 'session-end', {});
+  assert.strictEqual(anchorFiles(dir).length, 1, 'no new entries → no new anchor');
+  hook(dir, 'record', { prompt: 'more' });
+  hook(dir, 'session-end', {});
+  assert.strictEqual(anchorFiles(dir).length, 2);
+  assert.strictEqual(run(dir, ['verify']).status, 0);
+});
+
+test('auto-anchor during long sessions after autoAnchorHours', () => {
+  const dir = tmpProject();
+  fs.mkdirSync(path.join(dir, '.authorship'));
+  fs.writeFileSync(path.join(dir, '.authorship', 'config.json'), '{"autoAnchorHours": 0}');
+  hook(dir, 'record', { prompt: 'one' });
+  assert.strictEqual(anchorFiles(dir).length, 1);
+  const dir2 = tmpProject();
+  hook(dir2, 'record', { prompt: 'one' });
+  assert.strictEqual(anchorFiles(dir2).length, 0, 'default 24h: no anchor yet');
+  const dir3 = tmpProject();
+  fs.mkdirSync(path.join(dir3, '.authorship'));
+  fs.writeFileSync(path.join(dir3, '.authorship', 'config.json'), '{"autoAnchor": false}');
+  hook(dir3, 'record', { prompt: 'one' });
+  hook(dir3, 'session-end', {});
+  assert.strictEqual(anchorFiles(dir3).length, 0);
+});
+
+test('auto-anchor never anchors a broken chain', () => {
+  const dir = tmpProject();
+  hook(dir, 'record', { prompt: 'a' });
+  hook(dir, 'record', { prompt: 'b' });
+  const l = lines(dir);
+  l[0] = l[0].replace('"a"', '"z"');
+  fs.writeFileSync(ledgerOf(dir), l.join('\n') + '\n');
+  hook(dir, 'session-end', {});
+  assert.strictEqual(anchorFiles(dir).length, 0);
+});
+
+test('appends stay correct when the last entry is larger than the tail chunk', () => {
+  const dir = tmpProject();
+  hook(dir, 'record', { prompt: 'small' });
+  hook(dir, 'record', { prompt: 'x'.repeat(400 * 1024) });
+  hook(dir, 'record', { prompt: 'after big' });
+  fs.appendFileSync(ledgerOf(dir), '{"partial":');
+  hook(dir, 'record', { prompt: 'after crash' });
+  const es = entries(dir);
+  assert.deepStrictEqual(es.map((e) => e.seq), [1, 2, 3, 4, 5]);
+  assert.strictEqual(es[3].type, 'recovery');
+  assert.strictEqual(run(dir, ['verify']).status, 0);
 });
 
 test('module exports do not run the CLI', () => {
