@@ -1,0 +1,13 @@
+{
+  "name": "authorship-ledger",
+  "version": "1.0.0",
+  "description": "Protect your authorship when coding with AI: every prompt you type is logged to a tamper-evident, hash-chained ledger in your project, with reports and optional blockchain timestamps as evidence of your ideation.",
+  "author": {
+    "name": "GiovaneMisake",
+    "url": "https://github.com/GiovaneMisake"
+  },
+  "homepage": "https://github.com/GiovaneMisake/authorship-ledger",
+  "repository": "https://github.com/GiovaneMisake/authorship-ledger",
+  "license": "MIT",
+  "keywords": ["copyright", "authorship", "provenance", "audit", "prompts", "evidence", "intellectual-property", "timestamp", "diritto-d-autore"]
+}

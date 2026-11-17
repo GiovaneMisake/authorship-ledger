@@ -1,0 +1,8 @@
+{
+  "name": "authorship-ledger",
+  "private": true,
+  "description": "Claude Code plugin: tamper-evident ledger of human prompts as evidence of authorship.",
+  "license": "MIT",
+  "scripts": { "test": "node --test tests/ledger.test.js" },
+  "engines": { "node": ">=18" }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "authorship-ledger",
+  "description": "Evidence of human authorship for AI-assisted development.",
+  "owner": {
+    "name": "GiovaneMisake",
+    "url": "https://github.com/GiovaneMisake"
+  },
+  "plugins": [
+    {
+      "name": "authorship-ledger",
+      "source": "./plugins/authorship-ledger",
+      "description": "Logs every prompt you type to a tamper-evident, hash-chained ledger in your project, as evidence of your human authorship and ideation.",
+      "category": "security",
+      "keywords": ["copyright", "authorship", "provenance", "audit", "evidence"]
+    }
+  ]
+}
